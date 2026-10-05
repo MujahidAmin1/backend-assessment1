@@ -6,3 +6,6 @@ node_modules
 .windsurf/
 
 /src/generated/prisma
+*.db
+*.db-journal
+dist/
