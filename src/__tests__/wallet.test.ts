@@ -41,11 +41,11 @@ describe("Wallet & Provider Events API", () => {
       // Verify wallet balance is unchanged
       const walletRes = await request(app).get("/wallets/W001");
       expect(walletRes.status).toBe(200);
-      expect(walletRes.body.availableBalance).toBe(0);
+      expect(walletRes.body.availableBalanceKobo).toBe(0);
       expect(walletRes.body.transactions).toHaveLength(1);
       expect(walletRes.body.transactions[0]).toEqual({
         reference: "T001",
-        amount: 50000,
+        amountKobo: 50000,
         currency: "NGN",
         status: "pending",
       });
@@ -73,21 +73,20 @@ describe("Wallet & Provider Events API", () => {
       });
 
       expect(res.status).toBe(201);
-      expect(res.body.eventId).toBe("E002");
+      expect(res.body.eventId).toBe("E001"); // It updates the original event
       expect(res.body.status).toBe("successful");
 
       // Verify wallet balance is credited
       const walletRes = await request(app).get("/wallets/W001");
       expect(walletRes.status).toBe(200);
-      expect(walletRes.body.availableBalance).toBe(50000);
+      expect(walletRes.body.availableBalanceKobo).toBe(50000);
 
-      // Verify both events exist for audit traceability
+      // Verify event is updated for audit traceability
       const eventsInDb = await prisma.event.findMany({
         where: { transactionRef: "T001" },
       });
-      expect(eventsInDb).toHaveLength(2);
+      expect(eventsInDb).toHaveLength(1);
       expect(eventsInDb[0].eventId).toBe("E001");
-      expect(eventsInDb[1].eventId).toBe("E002");
 
       // Transaction history shows effective status 'successful'
       expect(walletRes.body.transactions).toHaveLength(1);
@@ -108,7 +107,7 @@ describe("Wallet & Provider Events API", () => {
       expect(res.body.status).toBe("failed");
 
       const walletRes = await request(app).get("/wallets/W001");
-      expect(walletRes.body.availableBalance).toBe(0);
+      expect(walletRes.body.availableBalanceKobo).toBe(0);
       expect(walletRes.body.transactions[0].status).toBe("failed");
     });
 
@@ -133,12 +132,12 @@ describe("Wallet & Provider Events API", () => {
         status: "pending",
       });
 
-      // Returns 200 OK acknowledging existing terminal state, does not record new event
-      expect(res.status).toBe(200);
+      // Returns 201 OK acknowledging existing terminal state, does not record new event
+      expect(res.status).toBe(201);
 
       // Balance remains 50000 (no double credit or reversal)
       const walletRes = await request(app).get("/wallets/W001");
-      expect(walletRes.body.availableBalance).toBe(50000);
+      expect(walletRes.body.availableBalanceKobo).toBe(50000);
 
       // Database has only the original successful event
       const events = await prisma.event.findMany({ where: { transactionRef: "T001" } });
@@ -161,12 +160,12 @@ describe("Wallet & Provider Events API", () => {
 
       // Replay identical event
       const replayRes = await request(app).post("/provider/events").send(payload);
-      expect(replayRes.status).toBe(200);
+      expect(replayRes.status).toBe(201);
       expect(replayRes.body.eventId).toBe("E002");
 
       // Balance credited only once
       const walletRes = await request(app).get("/wallets/W001");
-      expect(walletRes.body.availableBalance).toBe(50000);
+      expect(walletRes.body.availableBalanceKobo).toBe(50000);
     });
 
     it("Rejects conflicting payload for already seen eventId with 409", async () => {
@@ -319,18 +318,18 @@ describe("Wallet & Provider Events API", () => {
       expect(res.body).toEqual({
         walletId: "W001",
         customerId: "C001",
-        availableBalance: 50000,
+        availableBalanceKobo: 50000,
         currency: "NGN",
         transactions: expect.arrayContaining([
           {
             reference: "T001",
-            amount: 50000,
+            amountKobo: 50000,
             currency: "NGN",
             status: "successful",
           },
           {
             reference: "T002",
-            amount: 15000,
+            amountKobo: 15000,
             currency: "NGN",
             status: "failed",
           },

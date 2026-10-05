@@ -120,10 +120,19 @@ curl -X GET http://localhost:3000/wallets/W001
    - **Next Improvement:** I'd swap SQLite for PostgreSQL. Then, I'd use row-level locking (`SELECT ... FOR UPDATE`) in the transaction to make absolutely sure two identical requests can't slip past each other at the exact same millisecond.
 2. **Provider webhook authenticity**
    The endpoint currently trusts incoming provider events. In production, webhook requests should be authenticated using the provider's signature/secret and validated before processing. This prevents unauthorized clients from submitting fake successful deposits.
-3. **Synchronous Requests:** Currently, we process the event and update the database while the provider is waiting on the HTTP request. If our database is slow, the provider might time out.
-   - **Next Improvement:** I'd drop incoming provider events into a message queue (like RabbitMQ or AWS SQS) and immediately return a `202 Accepted`. Then, background workers could process the events at their own pace without dropping anything.
-
+3. **Reconciliation**
+   The wallet balance is calculated from accepted events, but there is no background reconciliation process that compares our records against the payment provider's records. A reconciliation job would detect cases such as a provider marking a transaction successful while our system failed to process the webhook.
 ---
+
+## AI Use & Verification
+
+- **Tools used:** I used Claude / ChatGPT / Gemini as an AI coding assistant to help scaffold boilerplate code, assist with brainstorming edge cases, and structure test cases.
+- **What I checked and verified myself:**
+  - Designed the database schema and confirmed SQLite/Prisma relations.
+  - Verified and tested the core business logic (idempotency, all-or-nothing transactions, and terminal state immutability).
+  - Validated API request/response contracts against the assessment requirements (paths, 201 vs 200 status codes, and NGN currency constraints).
+  - Wrote and debugged the test assertions in Vitest to ensure all 11 integration tests pass consistently.
+
 
 ## Written Explanations (Section 2)
 

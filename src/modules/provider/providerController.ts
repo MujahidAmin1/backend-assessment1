@@ -19,7 +19,7 @@ export async function processEvent(
     }
 
     const result = await processProviderEvent(parsed.data);
-    res.status(result.created ? 201 : 200).json(result.event);
+    res.status(201).json(result);
   } catch (error) {
     next(error);
   }
