@@ -1,91 +1,71 @@
 # Section 2: Written Explanation
 
-This document addresses the five core architectural, reliability, and security questions outlined in the assessment.
+Here are my answers to the five architectural questions from the assessment. I tried to focus on practical solutions for how these things actually break in the real world.
 
 ---
 
 ### 1. Concurrency: Preventing Duplicate Credits
 
-**Problem:** Two identical or overlapping requests (e.g. two concurrent `POST /provider/events` calls for the same `transactionRef` or `eventId`) arrive simultaneously across multiple API nodes, leading to potential race conditions where both threads read a pre-credit balance and both increment it.
+**Problem:** What if two requests for the exact same deposit hit our API at the exact same millisecond? If we aren't careful, both requests might read the old balance (say, 0), add 500 to it, and save it. We'd end up crediting the user twice.
 
-**Solution:**
-1. **Database Row Locks (`SELECT ... FOR UPDATE`):**
-   In a production SQL database (such as PostgreSQL), all event processing executes within a transaction that acquires a row-level lock on the target wallet or transaction record (`SELECT * FROM "Wallet" WHERE id = $1 FOR UPDATE`). Any concurrent request attempting to access the same wallet must wait until the active transaction commits or aborts.
-2. **Database Unique Constraints & Deduplication Table:**
-   Rely on ACID-compliant database constraints as the final safety net. A unique composite index or an idempotency log table (e.g., `UNIQUE(eventId)` and a single-credit status ledger on `transactionRef`) causes any second concurrent insert to immediately fail with a unique constraint error (`23505` in Postgres, `P2002` in Prisma), triggering a clean rollback.
-3. **Distributed Locks (Redis / Redlock):**
-   At the application gateway/worker layer, acquire a short-lived distributed mutex on the transaction key (`lock:txn:<transactionRef>`, TTL: 5–10s) before entering the business logic. If the lock is held, the second request either polls briefly or is rejected safely.
+**How I'd fix it:**
+For this assessment, SQLite's single-writer lock kind of protects us, but in a real production app (like with PostgreSQL), we need a stronger guarantee.
+
+1. **Database-level row locks (`SELECT ... FOR UPDATE`):** When processing a deposit, we should lock the wallet row in the database for the duration of the transaction. If a second request comes in for the same wallet, it has to wait until the first request is completely done (either committed or rolled back) before it can even read the balance.
+2. **Idempotency keys:** We'd also rely on the database's unique constraints. By enforcing a rule in the database that an `eventId` can only exist once, the second request would just fail with a "unique constraint violation" when it tries to insert the event. We catch that error and know it's a duplicate.
 
 ---
 
 ### 2. Crash Recovery: Database Failure Mid-Transaction
 
-**Problem:** The database or server crashes after an event is recorded in the table, but before the corresponding wallet balance is updated.
+**Problem:** What if the server crashes *after* we record the event but *before* we add the money to the wallet?
 
-**Behavior & Guarantee:**
-1. **ACID Transaction Atomicity:**
-   In our implementation, both the `Event.create()` and `Wallet.update({ balanceKobo: { increment: amount } })` operations are executed within an atomic database transaction (`prisma.$transaction(async (tx) => { ... })`).
-2. **Crash Scenario Outcome:**
-   - If the system, network, or database crashes prior to transaction commit, the database engine's Write-Ahead Log (WAL) or transaction journal recognizes the transaction as uncommitted upon recovery and automatically rolls back all intermediate writes.
-   - Neither the event nor the balance update will persist. The state remains completely clean and consistent.
-3. **Recovery on Provider Re-try:**
-   Payment providers adhere to retry schedules (exponential backoff). When the provider inevitably re-delivers the webhook, our system processes the event as a clean, fresh attempt without encountering corrupted or partial state.
+**How I handled it:**
+This is exactly why I wrapped the whole process inside a Prisma transaction (`prisma.$transaction`). 
+
+Databases are built to handle this using something called ACID guarantees. If the power goes out right after saving the event but before updating the wallet, the database realizes the transaction never fully finished (it never committed). When it boots back up, it automatically rolls back that partial insert. It's an all-or-nothing deal. 
+
+Because we roll back cleanly, when the payment provider inevitably retries the request a few minutes later, our system just processes it like a brand new event. No weird partial states to clean up.
 
 ---
 
-### 3. Webhook Authentication: Verifying Request Authenticity
+### 3. API Authentication: Verifying Request Authenticity
 
-**Strategy:**
-1. **HMAC Signature Verification (Shared Secret):**
-   - The provider signs the raw request payload using an agreed-upon secret key with a cryptographic hash algorithm (typically HMAC-SHA256) and transmits the signature in an HTTP header (e.g. `X-Provider-Signature: sha256=...`).
-   - Before parsing JSON into an object, our API extracts the raw request body bytes and recomputes `crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex')`.
-   - We compare signatures using constant-time comparison (`crypto.timingSafeEqual`) to prevent timing side-channel attacks.
-2. **Replay Attack Prevention via Timestamps:**
-   - The provider includes an `X-Provider-Timestamp` header in the signature calculation.
-   - Our middleware verifies that `Math.abs(Date.now() - timestamp) <= 300_000` (e.g. 5 minutes). Expired timestamps are rejected.
-3. **IP Whitelisting & Mutual TLS (mTLS):**
-   - If the provider publishes static egress CIDR ranges, traffic is filtered at the cloud load balancer / ingress firewall level.
-   - In enterprise banking architectures, mutual TLS (mTLS) with client certificates ensures cryptographic peer authentication at the transport layer.
+**Problem:** How do we know it's actually the bank calling our provider endpoint and not some random hacker trying to give themselves free money?
+
+**How I'd secure it:**
+You never trust data just because it hits your endpoint. 
+
+1. **HMAC Signatures (The standard way):** The provider should take the request body and sign it using a secret key only we and they know, usually creating a hash (like HMAC-SHA256). They send this hash in a header (like `X-Signature`). When we receive the request, we take the raw body, hash it with the same secret key, and compare our hash to theirs. If they match, we know the request hasn't been tampered with and it actually came from them.
+2. **Timestamp Checks:** To prevent someone from intercepting a valid request and just re-sending it later (a replay attack), the provider should include a timestamp in the signature. We'd check that the timestamp is within a reasonable window (like 5 minutes).
+3. **IP Whitelisting:** As an extra layer, we'd configure our firewall to only accept traffic on the provider endpoint from the provider's known IP addresses.
 
 ---
 
 ### 4. Balance Reconciliation: Verifying Wallet Balances Against Event History
 
-**Strategy:**
-1. **Scheduled Reconciliation Job (Periodic Cron / Worker):**
-   - A dedicated reconciliation worker runs periodically (e.g., daily at 00:00 UTC or hourly) using a read-replica database to avoid impacting operational traffic.
-2. **Formula & Calculation:**
-   For each wallet:
-   $$\text{Calculated Balance} = \sum_{\substack{\text{status} = \text{'successful'}}} \text{amountKobo}$$
-3. **Comparison & Discrepancy Handling:**
-   - The worker compares `wallet.balanceKobo` with `Calculated Balance`.
-   - If `wallet.balanceKobo !== Calculated Balance`:
-     1. An immutable `ReconciliationDiscrepancy` record is generated with a timestamp, variance amount, and involved event IDs.
-     2. An automated alert is sent to our internal engineering and operations team via Slack/PagerDuty.
-     3. An operations dashboard visualizes unsettled discrepancies for manual review or automated re-sync scripts.
-4. **Third-Party Provider Settlement File Reconciliation:**
-   - In addition to internal ledger auditing, we ingest daily settlement reports (MT940, CSV, or CAMT.053) directly from the partner bank/provider.
-   - We cross-reference provider `transactionRef` records against our internal database to detect any provider-side dropouts or fee discrepancies.
+**Problem:** Over time, bugs happen. How do we ensure the wallet balance exactly matches the sum of all their successful deposits?
+
+**How I'd verify it:**
+You need an automated script running in the background—usually a nightly cron job—that acts as an auditor.
+
+1. The script loops through all wallets.
+2. For each wallet, it adds up the `amountKobo` for every event where the status is `successful`. 
+3. It compares that calculated total to the actual `balanceKobo` saved on the wallet.
+
+If the numbers don't match, the script shouldn't try to automatically fix it (that's dangerous). Instead, it should flag the discrepancy, save it to a "Reconciliation Issues" table, and alert the engineering/ops team on Slack or PagerDuty so a human can investigate what went wrong.
 
 ---
 
-### 5. Missing Transactions: Handling Customer Funding Claims Without Webhooks
+### 5. Missing Transactions: Handling Customer Funding Claims Without Incoming Requests
 
-**Operational Runbook:**
-1. **Step 1: Obtain Customer Proof & Identifiers:**
-   Request the customer's transaction receipt containing:
-   - External provider transaction ID / Bank session ID / Payment reference
-   - Exact amount and timestamp
-   - Wallet ID or account number used
-2. **Step 2: Inspect Ingress & Dead-Letter Logs:**
-   - Query our raw API gateway logs, cloud firewall logs, and dead-letter queues (DLQ) for the customer's wallet ID or external reference to check if the webhook was blocked, dropped due to a 5xx error, or failed HMAC verification.
-3. **Step 3: Query Provider Verification API:**
-   - Call the payment provider's Transaction Status / Query API using our authenticated server credentials (`GET /transactions/verify/:externalRef`).
-   - Check if the provider acknowledges the payment as completed.
-4. **Step 4: Remediation:**
-   - **If the provider confirms success:**
-     Manually trigger or replay the event through an internal ops endpoint (`POST /admin/reconcile/events`) or via an administrative CLI tool with audit metadata (`reason: "customer dispute resolved via provider query"`, `adminId: "ops_user_123"`). This routes through the exact same idempotent business logic to credit the customer safely.
-   - **If the provider shows pending or failed:**
-     Inform the customer that the payment failed or is awaiting bank clearance, providing the provider's official reference code for bank tracing.
-   - **If the provider has no record:**
-     The customer's bank transfer likely failed before leaving their source financial institution; direct the customer to their issuing bank with their debit session trace ID.
+**Problem:** A customer says "I sent you money!" but our database has zero record of it. 
+
+**Steps I'd take to investigate and fix:**
+
+1. **Get the proof:** First, ask the customer for their receipt from the bank (we need the transaction reference number and the exact time/amount).
+2. **Check our front door:** Look at our server's raw access logs or firewall logs. Did the provider's request actually hit our server? If it did, maybe it failed authentication or crashed our app (returning a 500 error).
+3. **Ask the provider's API:** The most important step is to call the payment provider's API directly (like a `GET /transactions/{reference}` endpoint) to ask, "Hey, did this transaction actually succeed?" 
+4. **Fix it:** 
+   - If the provider says "Yes, it succeeded," then it was our fault for missing the incoming request. We'd have a secure, internal admin endpoint where our support team can manually trigger the deposit using the exact same logic.
+   - If the provider says "It failed" or "We have no record of that," we tell the customer the payment didn't go through on their bank's end and they need to contact their bank.

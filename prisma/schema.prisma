@@ -32,7 +32,6 @@ model Event {
   amountKobo     Int
   currency       String
   status         Status
-  createdAt      DateTime @default(now())
 
   wallet Wallet @relation(fields: [walletId], references: [walletId])
 

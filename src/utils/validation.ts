@@ -1,29 +1,5 @@
 import { z } from "zod";
 
-export const createWalletSchema = z
-  .object({
-    walletId: z
-      .string({ error: "Wallet ID is required" })
-      .trim()
-      .min(1, "Wallet ID is required")
-      .max(100, "Wallet ID cannot exceed 100 characters"),
-    customerId: z
-      .string({ error: "Customer ID is required" })
-      .trim()
-      .min(1, "Customer ID is required")
-      .max(100, "Customer ID cannot exceed 100 characters"),
-    balanceKobo: z
-      .number({ error: "Balance must be a number" })
-      .int("Balance must be a whole number")
-      .nonnegative("Balance cannot be negative"),
-    currency: z
-      .string({ error: "Currency is required" })
-      .trim()
-      .toUpperCase()
-      .refine((val) => val === "NGN", "Currency must be NGN"),
-  })
-  .strict();
-
 export const createEventSchema = z
   .object({
     eventId: z
@@ -57,4 +33,3 @@ export const createEventSchema = z
   .strict();
 
 export type CreateEventInput = z.infer<typeof createEventSchema>;
-export type CreateWalletInput = z.infer<typeof createWalletSchema>;

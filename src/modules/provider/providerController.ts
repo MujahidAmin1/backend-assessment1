@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import AppError from "../../utils/appError";
 import { createEventSchema } from "../../utils/validation";
-import { processProviderEvent } from "../wallet/walletService";
+import { processProviderEvent } from "./providerService";
 
 export async function processEvent(
   req: Request,

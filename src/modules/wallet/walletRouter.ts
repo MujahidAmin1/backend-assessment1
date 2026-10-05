@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createWalletController, getWallet } from "./walletController";
+import { getWallet } from "./walletController";
 
 const router = Router();
 
@@ -27,30 +27,6 @@ const router = Router();
  */
 router.get("/:walletId", getWallet);
 
-/**
- * @openapi
- * /wallets:
- *   post:
- *     tags: [Wallets]
- *     summary: Create a new wallet
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/CreateWalletInput'
- *     responses:
- *       201:
- *         description: Wallet created
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Wallet'
- *       400:
- *         description: Invalid wallet payload
- *       409:
- *         description: Wallet already exists
- */
-router.post("/", createWalletController);
+
 
 export default router;

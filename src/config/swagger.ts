@@ -12,21 +12,7 @@ const options: swaggerJsDoc.Options = {
     servers: [{ url: "/" }],
     components: {
       schemas: {
-        CreateWalletInput: {
-          type: "object",
-          required: ["walletId", "customerId", "balanceKobo", "currency"],
-          additionalProperties: false,
-          properties: {
-            walletId: { type: "string", example: "W001" },
-            customerId: { type: "string", example: "C001" },
-            balanceKobo: { type: "integer", minimum: 0, example: 0 },
-            currency: {
-              type: "string",
-              enum: ["NGN"],
-              example: "NGN",
-            },
-          },
-        },
+
         EventStatus: {
           type: "string",
           enum: ["pending", "successful", "failed"],
@@ -48,11 +34,6 @@ const options: swaggerJsDoc.Options = {
             amountKobo: { type: "integer", minimum: 1, example: 250000 },
             currency: { type: "string", enum: ["NGN"], example: "NGN" },
             status: { $ref: "#/components/schemas/EventStatus" },
-            createdAt: {
-              type: "string",
-              format: "date-time",
-              description: "Timestamp of event creation",
-            },
           },
         },
         Wallet: {

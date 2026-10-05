@@ -84,7 +84,6 @@ describe("Wallet & Provider Events API", () => {
       // Verify both events exist for audit traceability
       const eventsInDb = await prisma.event.findMany({
         where: { transactionRef: "T001" },
-        orderBy: { createdAt: "asc" },
       });
       expect(eventsInDb).toHaveLength(2);
       expect(eventsInDb[0].eventId).toBe("E001");
@@ -346,41 +345,5 @@ describe("Wallet & Provider Events API", () => {
     });
   });
 
-  describe("POST /wallets", () => {
-    it("Creates a new wallet successfully", async () => {
-      const res = await request(app).post("/wallets").send({
-        walletId: "W002",
-        customerId: "C002",
-        balanceKobo: 10000,
-        currency: "NGN",
-      });
 
-      expect(res.status).toBe(201);
-      expect(res.body.walletId).toBe("W002");
-      expect(res.body.balanceKobo).toBe(10000);
-    });
-
-    it("Rejects duplicate walletId with 409", async () => {
-      const res = await request(app).post("/wallets").send({
-        walletId: "W001", // already seeded
-        customerId: "C001",
-        balanceKobo: 0,
-        currency: "NGN",
-      });
-
-      expect(res.status).toBe(409);
-      expect(res.body.message).toMatch(/wallet already exists/i);
-    });
-
-    it("Rejects invalid wallet creation payload with 400", async () => {
-      const res = await request(app).post("/wallets").send({
-        walletId: "W003",
-        customerId: "C003",
-        balanceKobo: -50, // Negative balance
-        currency: "USD",  // Non-NGN
-      });
-
-      expect(res.status).toBe(400);
-    });
-  });
 });
