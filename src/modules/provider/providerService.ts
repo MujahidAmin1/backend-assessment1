@@ -2,116 +2,184 @@ import { prisma } from "../../config/prisma";
 import AppError from "../../utils/appError";
 import type { CreateEventInput } from "../../utils/validation";
 
-/**
- * Process an incoming deposit event from the payment provider.
- *
- * All checks and mutations run inside a single database transaction
- * to guarantee atomicity: the event record and the wallet balance
- * update either both commit or both roll back.
- *
- * Returns { event, created } where `created` indicates whether
- * a new event record was written (true) or an existing one was
- * returned idempotently (false).
- */
 export async function processProviderEvent(input: CreateEventInput) {
   return prisma.$transaction(async (tx) => {
-    // ── 1. Idempotency by eventId ──────────────────────────────
+    // Check whether we have already received this exact event.
+    //
+    // eventId is the provider's identifier for a particular event.
+    // Receiving the same event again should have no additional effect.
     const existingEvent = await tx.event.findUnique({
-      where: { eventId: input.eventId },
+      where: {
+        eventId: input.eventId,
+      },
     });
 
     if (existingEvent) {
-      const isIdentical =
-        existingEvent.transactionRef === input.transactionRef &&
-        existingEvent.walletId === input.walletId &&
-        existingEvent.amountKobo === input.amountKobo &&
-        existingEvent.currency === input.currency;
+      // A reused eventId is only acceptable if the important
+      // transaction details are the same as the original event.
+      //
+      // For example, E001 originally says ₦2,500 but someone later
+      // sends E001 with ₦5,000. That must be rejected.
+      const hasConflict =
+        existingEvent.transactionRef !== input.transactionRef ||
+        existingEvent.walletId !== input.walletId ||
+        existingEvent.amountKobo !== input.amountKobo ||
+        existingEvent.currency !== input.currency;
 
-      if (!isIdentical) {
-        throw new AppError("eventId conflicts with an existing event", 409);
-      }
-
-      // Exact duplicate — safe to return without side effects.
-      return { event: existingEvent, created: false };
-    }
-
-    // ── 2. Wallet must exist ───────────────────────────────────
-    const wallet = await tx.wallet.findUnique({
-      where: { walletId: input.walletId },
-    });
-
-    if (!wallet) {
-      throw new AppError("Wallet does not exist", 404);
-    }
-
-    // ── 3. TransactionRef checks ───────────────────────────────
-    const priorEvents = await tx.event.findMany({
-      where: { transactionRef: input.transactionRef },
-    });
-    
-    // Reverse the array to process newest events first (emulating desc order)
-    priorEvents.reverse();
-
-    let shouldCredit = false;
-
-    if (priorEvents.length > 0) {
-      const reference = priorEvents[0];
-
-      // Reject if wallet, amount, or currency differ from earlier events
-      if (
-        reference.walletId !== input.walletId ||
-        reference.amountKobo !== input.amountKobo ||
-        reference.currency !== input.currency
-      ) {
+      if (hasConflict) {
         throw new AppError(
-          "Transaction reference conflicts with existing transaction",
+          "eventId conflicts with an existing event",
           409,
         );
       }
 
-      // Terminal states are final — no further state changes allowed
-      const terminalEvent = priorEvents.find(
-        (e) => e.status === "successful" || e.status === "failed",
-      );
-
-      if (terminalEvent) {
-        // Transaction already settled; acknowledge without recording.
-        return { event: terminalEvent, created: false };
-      }
-
-      // Transaction is currently pending
-      if (input.status === "pending") {
-        // Duplicate pending — no state change
-        return { event: reference, created: false };
-      }
-
-      // Transition: pending → successful or pending → failed
-      shouldCredit = input.status === "successful";
-    } else {
-      // Brand-new transaction
-      shouldCredit = input.status === "successful";
+      // Same eventId with the same details means this is a replay.
+      // Return the existing event without changing the wallet.
+      return existingEvent;
     }
 
-    // ── 4. Persist the event ───────────────────────────────────
-    const newEvent = await tx.event.create({
-      data: {
-        eventId: input.eventId,
-        transactionRef: input.transactionRef,
+    // The wallet must exist before we can process the deposit.
+    const wallet = await tx.wallet.findUnique({
+      where: {
         walletId: input.walletId,
-        amountKobo: input.amountKobo,
-        currency: input.currency,
-        status: input.status,
       },
     });
 
-    // ── 5. Credit wallet balance (successful deposits only) ────
-    if (shouldCredit) {
-      await tx.wallet.update({
-        where: { walletId: input.walletId },
-        data: { balanceKobo: { increment: input.amountKobo } },
+    if (!wallet) {
+      throw new AppError("wallet does not exist", 404);
+    }
+
+    // Look for an existing event belonging to the same transaction.
+    //
+    // We use transactionRef to identify the underlying transaction,
+    // because a provider can send multiple events for the same transaction.
+    //
+    // Example:
+    // E001 → T001 → pending
+    // E002 → T001 → successful
+    //
+    // These are two events for the same transaction.
+    const existingTransaction = await tx.event.findFirst({
+      where: {
+        transactionRef: input.transactionRef,
+      },
+      orderBy: {
+        eventId: "desc",
+      },
+    });
+
+    // This is a brand-new transaction.
+    if (!existingTransaction) {
+      // Create the first event for this transaction.
+      const newEvent = await tx.event.create({
+        data: {
+          eventId: input.eventId,
+          transactionRef: input.transactionRef,
+          walletId: input.walletId,
+          amountKobo: input.amountKobo,
+          currency: input.currency,
+          status: input.status,
+        },
+      });
+
+      // Only a successful deposit increases the available balance.
+      if (input.status === "successful") {
+        await tx.wallet.update({
+          where: {
+            walletId: input.walletId,
+          },
+          data: {
+            balanceKobo: {
+              increment: input.amountKobo,
+            },
+          },
+        });
+      }
+
+      return newEvent;
+    }
+
+    // The same transactionRef must always refer to the same
+    // wallet, amount and currency.
+    //
+    // If T001 originally represented:
+    // W001 / 250000 / NGN
+    //
+    // we must reject a later T001 saying:
+    // W001 / 300000 / NGN
+    const hasTransactionConflict =
+      existingTransaction.walletId !== input.walletId ||
+      existingTransaction.amountKobo !== input.amountKobo ||
+      existingTransaction.currency !== input.currency;
+
+    if (hasTransactionConflict) {
+      throw new AppError(
+        "transaction reference conflicts with existing transaction",
+        409,
+      );
+    }
+
+    // Successful and failed are terminal states.
+    //
+    // Once a transaction reaches either state, later events must not
+    // change its status or affect the wallet balance.
+    if (
+      existingTransaction.status === "successful" ||
+      existingTransaction.status === "failed"
+    ) {
+      return existingTransaction;
+    }
+
+    // At this point the existing transaction is pending.
+    //
+    // A later pending event doesn't change anything.
+    if (input.status === "pending") {
+      return existingTransaction;
+    }
+
+    // Pending → failed.
+    //
+    // The transaction becomes terminal, but the wallet is not credited.
+    if (input.status === "failed") {
+      return tx.event.update({
+        where: {
+          eventId: existingTransaction.eventId,
+        },
+        data: {
+          status: "failed",
+        },
       });
     }
 
-    return { event: newEvent, created: true };
+    // The only remaining possibility is:
+    //
+    // pending → successful
+    //
+    // This is the point where we credit the wallet.
+    const updatedEvent = await tx.event.update({
+      where: {
+        eventId: existingTransaction.eventId,
+      },
+      data: {
+        status: "successful",
+      },
+    });
+
+    // The event status update and wallet credit happen inside
+    // the same database transaction.
+    //
+    // If either operation fails, Prisma rolls the whole transaction back.
+    await tx.wallet.update({
+      where: {
+        walletId: input.walletId,
+      },
+      data: {
+        balanceKobo: {
+          increment: input.amountKobo,
+        },
+      },
+    });
+
+    return updatedEvent;
   });
 }
